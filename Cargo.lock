@@ -2271,6 +2271,7 @@ name = "iroh"
 version = "0.92.0"
 dependencies = [
  "aead",
+ "anyhow",
  "axum",
  "backon",
  "bytes",

@@ -1,93 +1,125 @@
-//! The smallest example showing how to use iroh and [`iroh::Endpoint`] to connect to a remote node.
-//!
-//! We use the node ID (the PublicKey of the remote node), the direct UDP addresses, and the relay url to achieve a connection.
-//!
-//! This example uses the default relay servers to attempt to holepunch, and will use that relay server to relay packets if the two devices cannot establish a direct UDP connection.
-//!
-//! Run the `listen` example first (`iroh/examples/listen.rs`), which will give you instructions on how to run this example to watch two nodes connect and exchange bytes.
-use std::net::SocketAddr;
+//! Connect example: prefer direct (hole-punch) first, relay as fallback.
+//
+// Usage (LAN / direct):
+//   cargo run -p iroh --example connect -- \
+//     --node-id <ID> \
+//     --addrs "10.0.0.5:51820"
+//
+// Usage (Internet with relay fallback):
+//   cargo run -p iroh --example connect -- \
+//     --node-id <ID> \
+//     --addrs "10.0.0.5:51820" \
+//     --relay-url https://euc1-1.relay.n0.iroh.iroh.link/
 
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use anyhow::{bail, Result};
 use clap::Parser;
 use iroh::{Endpoint, NodeAddr, RelayMode, RelayUrl, SecretKey};
-use n0_snafu::{Result, ResultExt};
-use n0_watcher::Watcher as _;
-use tracing::info;
+use n0_watcher::Watcher as _; // for .initialized()
+use tokio::time::{sleep, timeout};
+use tracing::{debug, error, info};
 
-// An example ALPN that we are using to communicate over the `Endpoint`
 const EXAMPLE_ALPN: &[u8] = b"n0/iroh/examples/magic/0";
+const DIRECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Parser)]
 struct Cli {
-    /// The id of the remote node.
+    /// Remote node id (public key)
     #[clap(long)]
     node_id: iroh::NodeId,
-    /// The list of direct UDP addresses for the remote node.
+
+    /// Direct UDP addresses (one or more)
     #[clap(long, value_parser, num_args = 1.., value_delimiter = ' ')]
     addrs: Vec<SocketAddr>,
-    /// The url of the relay server the remote node can also be reached at.
+
+    /// Optional relay URL (used only as fallback)
     #[clap(long)]
-    relay_url: RelayUrl,
+    relay_url: Option<RelayUrl>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-    println!("\nconnect example!\n");
+
     let args = Cli::parse();
+    println!("\nconnect example (prefer direct, relay fallback)\n");
+
+    // ephemeral key
     let secret_key = SecretKey::generate(rand::rngs::OsRng);
     println!("public key: {}", secret_key.public());
 
-    // Build a `Endpoint`, which uses PublicKeys as node identifiers, uses QUIC for directly connecting to other nodes, and uses the relay protocol and relay servers to holepunch direct connections between nodes when there are NATs or firewalls preventing direct connections. If no direct connection can be made, packets are relayed over the relay servers.
+    // endpoint
     let endpoint = Endpoint::builder()
-        // The secret key is used to authenticate with other nodes. The PublicKey portion of this secret key is how we identify nodes, often referred to as the `node_id` in our codebase.
         .secret_key(secret_key)
-        // Set the ALPN protocols this endpoint will accept on incoming connections
         .alpns(vec![EXAMPLE_ALPN.to_vec()])
-        // `RelayMode::Default` means that we will use the default relay servers to holepunch and relay.
-        // Use `RelayMode::Custom` to pass in a `RelayMap` with custom relay urls.
-        // Use `RelayMode::Disable` to disable holepunching and relaying over HTTPS
-        // If you want to experiment with relaying using your own relay server, you must pass in the same custom relay url to both the `listen` code AND the `connect` code
-        .relay_mode(RelayMode::Default)
-        // You can choose an address to bind to, but passing in `None` will bind the socket to a random available port
+        .relay_mode(RelayMode::Default) // allow relay as fallback; we choose via NodeAddr
         .bind()
         .await?;
 
     let me = endpoint.node_id();
-    println!("node id: {me}");
-    println!("node listening addresses:");
-    for local_endpoint in endpoint.direct_addresses().initialized().await {
-        println!("\t{}", local_endpoint.addr)
+    println!("local node id: {me}");
+    println!("local listening addresses:");
+    for local in endpoint.direct_addresses().initialized().await {
+        println!("\t{}", local.addr);
     }
 
-    let relay_url = endpoint
-        .home_relay()
-        .get()
-        .first()
-        .cloned()
-        .expect("should be connected to a relay server, try calling `endpoint.local_endpoints()` or `endpoint.connect()` first, to ensure the endpoint has actually attempted a connection before checking for the connected relay server");
-    println!("node relay server url: {relay_url}\n");
-    // Build a `NodeAddr` from the node_id, relay url, and UDP addresses.
-    let addr = NodeAddr::from_parts(args.node_id, Some(args.relay_url), args.addrs);
+    // 1) DIRECT attempt (no relay in NodeAddr)
+    let addr_direct = NodeAddr::from_parts(args.node_id, None, args.addrs.clone());
+    info!("Attempting DIRECT (hole-punch) to {:?}", addr_direct);
 
-    // Attempt to connect, over the given ALPN.
-    // Returns a Quinn connection.
-    let conn = endpoint.connect(addr, EXAMPLE_ALPN).await?;
-    info!("connected");
+    let direct_result = timeout(DIRECT_TIMEOUT, endpoint.connect(addr_direct, EXAMPLE_ALPN)).await;
 
-    // Use the Quinn API to send and recv content.
-    let (mut send, mut recv) = conn.open_bi().await.e()?;
+    match direct_result {
+        // Direct connection established
+        Ok(Ok(conn)) => {
+            info!("✅ Direct connection established (hole-punch/LAN).");
+            handle_connection(conn).await?;
+            endpoint.close().await;
+            return Ok(());
+        }
+        // connect() returned error before timeout
+        Ok(Err(e)) => {
+            error!("Direct connect error: {e}");
+        }
+        // timeout expired
+        Err(_) => {
+            debug!("Direct connect timed out after {:?}", DIRECT_TIMEOUT);
+        }
+    }
 
-    let message = format!("{me} is saying 'hello!'");
-    send.write_all(message.as_bytes()).await.e()?;
+    // 2) Relay fallback (only if provided)
+    if let Some(relay_url) = args.relay_url.clone() {
+        info!("Trying RELAY fallback via {}", relay_url);
+        // brief wait so endpoint can register with home relay (optional)
+        sleep(Duration::from_millis(200)).await;
 
-    // Call `finish` to close the send side of the connection gracefully.
-    send.finish().e()?;
-    let message = recv.read_to_end(100).await.e()?;
-    let message = String::from_utf8(message).e()?;
-    println!("received: {message}");
+        let addr_relay = NodeAddr::from_parts(args.node_id, Some(relay_url), args.addrs.clone());
+        let conn = endpoint.connect(addr_relay, EXAMPLE_ALPN).await?;
+        info!("🔁 Connected using RELAY (fallback).");
+        handle_connection(conn).await?;
+        endpoint.close().await;
+        Ok(())
+    } else {
+        endpoint.close().await;
+        bail!("direct connect failed and no --relay-url provided");
+    }
+}
 
-    // We received the last message: close all connections and allow for the close
-    // message to be sent.
-    endpoint.close().await;
+// Simple roundtrip: send one message, read one response.
+async fn handle_connection(conn: iroh::endpoint::Connection) -> Result<()> {
+    info!("opening bidi stream…");
+    let (mut send, mut recv) = conn.open_bi().await?;
+
+    let msg = "hello from connector";
+    use tokio::io::AsyncWriteExt;
+    send.write_all(msg.as_bytes()).await?;
+    // finish() is sync in this API
+    send.finish()?;
+
+    // iroh's recv has a convenience read_to_end(limit) -> Vec<u8>
+    let data = recv.read_to_end(16 * 1024).await?;
+    println!("received: {}", String::from_utf8_lossy(&data));
     Ok(())
 }

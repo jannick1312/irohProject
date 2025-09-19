@@ -100,7 +100,8 @@ tracing-subscriber = { version = "0.3", features = [
     "env-filter",
 ], optional = true }
 indicatif = { version = "0.18", features = ["tokio"], optional = true }
-parse-size = { version = "=1.0.0", optional = true, features = ['std'] } # pinned version to avoid bumping msrv to 1.81
+parse-size = { version = "=1.0.0", optional = true, features = ['std'] }
+anyhow = "1.0.99" # pinned version to avoid bumping msrv to 1.81
 
 # non-wasm-in-browser dependencies
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
@@ -165,7 +166,7 @@ wasm-bindgen-test = "0.3"
 cfg_aliases = { version = "0.2.1" }
 
 [features]
-default = ["metrics"]
+default = ["metrics", "examples"]
 metrics = ["iroh-metrics/metrics", "iroh-relay/metrics", "portmapper/metrics"]
 test-utils = ["iroh-relay/test-utils", "iroh-relay/server", "dep:axum"]
 discovery-local-network = ["dep:swarm-discovery"]
